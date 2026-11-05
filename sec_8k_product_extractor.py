@@ -88,13 +88,15 @@ def ticker_map():
     return {v["ticker"]: (str(v["cik_str"]).zfill(10), v["title"]) for v in data.values()}
 
 
-def recent_8ks(cik, limit):
+def recent_8ks(cik, limit, min_date="2025-01-01"):
     """Latest 8-Ks that carry an announcement item (7.01 Reg FD / 8.01 Other events)."""
     d = get(f"https://data.sec.gov/submissions/CIK{cik}.json").json()
     r = d["filings"]["recent"]
     out = []
     for form, acc, doc, when, items in zip(r["form"], r["accessionNumber"], r["primaryDocument"],
                                            r["acceptanceDateTime"], r["items"]):
+        if when[:10] < min_date:  # submissions are newest-first, so everything after this is older too
+            break
         if form == "8-K" and any(i in items.split(",") for i in ITEMS_OK):
             out.append({"acc": acc, "doc": doc, "time": when, "name": d["name"]})
             if len(out) >= limit:
@@ -149,7 +151,9 @@ PROMPT = """You analyze an SEC 8-K filing from {company} ({ticker}).
 Extract ONLY NEW products, services or platforms that the company is announcing or launching in this filing.
 Do NOT include: existing/legacy products or business segments; financial instruments (notes, bonds, stock, preferred
 shares, options, credit facilities); earnings results; presentations, reports or conferences; acquisitions of
-companies; executives; or events. For pharma/biotech, include a drug only if it is newly launched, newly approved or
+companies; executives; or events; infrastructure, construction, capacity or capital-expenditure plans; IPOs, joint
+ventures, contracts or awards; internal programs, initiatives or restructurings. A product must be something a
+customer can buy or use (hardware, software, drug, consumer good, service). For pharma/biotech, include a drug only if it is newly launched, newly approved or
 newly unveiled in this filing - NOT a clinical-trial data update or regulatory acceptance for an already known drug.
 Most filings have 0 or 1 new product; there may be more.
 NER hints (may be noisy) - organizations: {orgs}; product-like entities: {prods}.
@@ -188,6 +192,33 @@ def extract_products(company, ticker, text, orgs, prods):
     return out
 
 
+JUDGE = """You are a strict fact-checker. Below are candidate "new products" extracted from an SEC 8-K of {company}.
+Keep ONLY items that are a genuinely NEW commercial product, service, platform or feature that the company launched
+or unveiled for customers. Reject: clinical-trial results, regulatory filings/acceptances/approvals of already-known
+drugs, financings, IPOs, joint ventures, contracts, infrastructure/energy/capacity projects, internal programs or
+initiatives, restructurings, earnings items, and products that merely resumed shipping or changed pharmacy.
+Return ONLY JSON: {{"keep": [indices of items to keep]}}.
+
+{items}"""
+
+
+def verify_products(company, found):
+    """Second LLM pass (precision filter): keep only candidates that are truly new product launches."""
+    if not found:
+        return found
+    from openai import OpenAI
+    listing = "\n".join(f"{i}. {n}: {d}" for i, (n, d) in enumerate(found))
+    resp = OpenAI().chat.completions.create(
+        model=MODEL, temperature=0, response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": JUDGE.format(company=company, items=listing)}],
+    )
+    try:
+        keep = {int(i) for i in json.loads(resp.choices[0].message.content).get("keep", [])}
+    except (json.JSONDecodeError, AttributeError, ValueError, TypeError):
+        return found  # if the judge fails, fall back to the first-pass result
+    return [x for i, x in enumerate(found) if i in keep]
+
+
 FIELDS = ["company_name", "stock_name", "filing_time", "new_product", "product_description"]
 
 
@@ -218,6 +249,8 @@ def main():
     ap.add_argument("--target-rows", type=int, default=100, help="stop once the CSV has this many product rows")
     ap.add_argument("--max-docs", type=int, default=2000, help="safety cap on the number of filings analysed")
     ap.add_argument("--per-company", type=int, default=5, help="max 8-Ks (Item 7.01/8.01) read per company")
+    ap.add_argument("--max-rows-per-company", type=int, default=4, help="cap rows per company so the sample is diverse")
+    ap.add_argument("--min-date", default="2025-01-01", help="ignore 8-Ks filed before this date (YYYY-MM-DD)")
     ap.add_argument("--out", default="products.csv")
     ap.add_argument("--seed", type=int, default=42, help="shuffle seed so the sample spans the whole index")
     args = ap.parse_args()
@@ -237,17 +270,19 @@ def main():
             continue
         cik, _title = tmap[t]
         try:
-            filings = recent_8ks(cik, args.per_company)
+            filings = recent_8ks(cik, args.per_company, args.min_date)
         except Exception as e:
             print(f"[error] {t}: {e}")
             continue
+        company_rows = 0
         for f in filings:
-            if len(rows) >= args.target_rows or docs >= args.max_docs:
+            if len(rows) >= args.target_rows or docs >= args.max_docs or company_rows >= args.max_rows_per_company:
                 break
             try:
                 text = filing_text(cik, f)                                   # main doc + EX-99 exhibits
                 excerpt, orgs, prods = ner_context(nlp, text)                # NER filtering
-                found = extract_products(f["name"], t, excerpt, orgs, prods) if excerpt else []  # LLM
+                found = extract_products(f["name"], t, excerpt, orgs, prods) if excerpt else []  # LLM pass 1
+                found = verify_products(f["name"], found)[: args.max_rows_per_company - company_rows]  # LLM pass 2
             except Exception as e:
                 if "401" in str(e):
                     sys.exit("OpenAI rejected the API key (401). Fix OPENAI_API_KEY in .env and retry.")
@@ -255,6 +290,7 @@ def main():
                 continue
             docs += 1
             companies.add(t)
+            company_rows += len(found)
             for name, desc in found:
                 rows.append({"company_name": f["name"], "stock_name": t, "filing_time": f["time"],
                              "new_product": name, "product_description": desc})
