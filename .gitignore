@@ -1,3 +1,5 @@
 .env
 .venv/
 ~$*
+run.log
+watch_progress.py

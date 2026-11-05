@@ -64,6 +64,7 @@ MAX_DESC = 179  # "less than 180 characters"
 
 
 def get(url, **kw):
+    """HTTP GET with the SEC-required User-Agent and a small delay to respect the rate limit."""
     time.sleep(0.15)  # SEC fair access: <= 10 requests/second
     r = requests.get(url, headers=HEADERS, timeout=30, **kw)
     r.raise_for_status()
@@ -71,6 +72,7 @@ def get(url, **kw):
 
 
 def sp500_tickers():
+    """Return the current S&P 500 tickers (Wikipedia table), or a fallback list if the page is unreachable."""
     try:
         html = get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies").text
         table = BeautifulSoup(html, "lxml").find("table", id="constituents")
@@ -81,6 +83,7 @@ def sp500_tickers():
 
 
 def ticker_map():
+    """Map ticker -> (10-digit CIK, company title) using the SEC company_tickers.json file."""
     data = get("https://www.sec.gov/files/company_tickers.json").json()
     return {v["ticker"]: (str(v["cik_str"]).zfill(10), v["title"]) for v in data.values()}
 
@@ -160,11 +163,13 @@ BAD = re.compile(r"\b(notes?|bonds?|debentures?|warrants?|credit facility|loan|s
 
 
 def clip(s, n=MAX_DESC):
+    """Collapse whitespace and cut the text at a word boundary so it stays under the 180-character limit."""
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[: n - 1].rsplit(" ", 1)[0].rstrip(",;:.") + "…"
 
 
 def extract_products(company, ticker, text, orgs, prods):
+    """Ask the LLM for NEW products in the excerpt; returns a list of (name, description) tuples."""
     from openai import OpenAI
     resp = OpenAI().chat.completions.create(
         model=MODEL, temperature=0, response_format={"type": "json_object"},
@@ -183,58 +188,82 @@ def extract_products(company, ticker, text, orgs, prods):
     return out
 
 
+FIELDS = ["company_name", "stock_name", "filing_time", "new_product", "product_description"]
+
+
+def dedupe(rows):
+    """Drop repeated (ticker, product, filing date) rows that appear when a filing is mentioned twice."""
+    seen, out = set(), []
+    for r in rows:
+        key = (r["stock_name"], r["new_product"].lower(), r["filing_time"][:10])
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def write_csv(rows, path):
+    """Write the extracted rows to CSV using the exact column names required by the assignment."""
+    rows = dedupe(rows)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=FIELDS, quoting=csv.QUOTE_ALL)
+        w.writeheader()
+        w.writerows(rows)
+
+
 def main():
+    """Walk through S&P 500 companies, analyse their 8-Ks and stop once enough product rows are collected."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--tickers", help="comma-separated; default = S&P 500")
-    ap.add_argument("--max-docs", type=int, default=100, help="stop after this many filings")
-    ap.add_argument("--per-company", type=int, default=2)
+    ap.add_argument("--target-rows", type=int, default=100, help="stop once the CSV has this many product rows")
+    ap.add_argument("--max-docs", type=int, default=2000, help="safety cap on the number of filings analysed")
+    ap.add_argument("--per-company", type=int, default=5, help="max 8-Ks (Item 7.01/8.01) read per company")
     ap.add_argument("--out", default="products.csv")
     ap.add_argument("--seed", type=int, default=42, help="shuffle seed so the sample spans the whole index")
     args = ap.parse_args()
 
     import spacy
-    nlp = spacy.load("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")  # NER model: ORG / PRODUCT entities
     tmap = ticker_map()
     tickers = [t.strip().upper() for t in args.tickers.split(",")] if args.tickers else sp500_tickers()
-
     if not args.tickers:
-        random.Random(args.seed).shuffle(tickers)
-    rows, docs = [], 0
+        random.Random(args.seed).shuffle(tickers)  # avoid an alphabetical (A-C only) sample
+
+    rows, docs, companies = [], 0, set()
     for t in tickers:
-        if docs >= args.max_docs:
+        if len(rows) >= args.target_rows or docs >= args.max_docs:
             break
         if t not in tmap:
             continue
-        cik, title = tmap[t]
+        cik, _title = tmap[t]
         try:
             filings = recent_8ks(cik, args.per_company)
         except Exception as e:
             print(f"[error] {t}: {e}")
             continue
         for f in filings:
-            if docs >= args.max_docs:
+            if len(rows) >= args.target_rows or docs >= args.max_docs:
                 break
             try:
-                text = filing_text(cik, f)
-                excerpt, orgs, prods = ner_context(nlp, text)
-                found = extract_products(f["name"], t, excerpt, orgs, prods) if excerpt else []
+                text = filing_text(cik, f)                                   # main doc + EX-99 exhibits
+                excerpt, orgs, prods = ner_context(nlp, text)                # NER filtering
+                found = extract_products(f["name"], t, excerpt, orgs, prods) if excerpt else []  # LLM
             except Exception as e:
                 if "401" in str(e):
                     sys.exit("OpenAI rejected the API key (401). Fix OPENAI_API_KEY in .env and retry.")
-                print(f"[error] {t} {f['acc']}: {e}")
+                print(f"[error] {t} {f['acc']}: {e}", flush=True)
                 continue
             docs += 1
-            print(f"[{docs}/{args.max_docs}] {t} {f['time'][:10]}: {len(found)} new product(s)")
+            companies.add(t)
             for name, desc in found:
                 rows.append({"company_name": f["name"], "stock_name": t, "filing_time": f["time"],
                              "new_product": name, "product_description": desc})
+            print(f"[docs={docs} rows={len(rows)}/{args.target_rows}] {t} {f['time'][:10]}: "
+                  f"{len(found)} new product(s)", flush=True)
+        write_csv(rows, args.out)  # save progress after every company
 
-    with open(args.out, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=["company_name", "stock_name", "filing_time", "new_product",
-                                           "product_description"], quoting=csv.QUOTE_ALL)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"Processed {docs} filings, wrote {len(rows)} rows -> {args.out}")
+    write_csv(rows, args.out)
+    print(f"DONE: {docs} filings from {len(companies)} companies -> {len(rows)} rows in {args.out}")
 
 
 if __name__ == "__main__":
